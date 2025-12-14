@@ -1,0 +1,139 @@
+# --- CELL 2: STRESS TEST (WITH HAHN ECHO FIX) ---
+
+# 1. AUTHENTICATION (Safety check)
+MY_TOKEN = "MYAPIKEYYOUCANTSEE"
+try:
+    QiskitRuntimeService.save_account(channel="ibm_quantum_platform", token=MY_TOKEN, overwrite=True)
+    service = QiskitRuntimeService()
+except:
+    pass 
+
+# 2. SELECT HARDWARE
+target_backend_name = 'ibm_fez'
+try:
+    backend = service.backend(target_backend_name)
+    print(f"[Status] Targeted backend '{target_backend_name}' found.")
+except:
+    backend = service.least_busy(operational=True, simulator=False, min_num_qubits=5)
+print(f"[Status] Deploying to: {backend.name}")
+
+# 3. DEFINE HAHN ECHO CIRCUIT
+def create_pge_echo_circuit(delay_us):
+    """
+    Implements PGE Loop with Dynamical Decoupling (Hahn Echo) 
+    on the Grid Qubit (q2) to suppress Phase Drift.
+    """
+    qr = QuantumRegister(3, 'q')
+    cr_hop1 = ClassicalRegister(2, 'hop1')
+    cr_hop2 = ClassicalRegister(2, 'hop2') 
+    result = ClassicalRegister(1, 'verified')
+    qc = QuantumCircuit(qr, cr_hop1, cr_hop2, result)
+    
+    qc.name = f"PGE_Echo_{delay_us}us"
+
+    # Mint Seal |->
+    qc.x(0)
+    qc.h(0)
+    qc.barrier()
+
+    # Hop 1: Outbound
+    qc.h(1)
+    qc.cx(1, 2)
+    qc.cx(0, 1)
+    qc.h(0)
+    qc.measure(0, cr_hop1[0])
+    qc.measure(1, cr_hop1[1])
+    with qc.if_test((cr_hop1[1], 1)):
+        qc.x(2)
+    with qc.if_test((cr_hop1[0], 1)):
+        qc.z(2)
+        
+    # --- THE FIX: HAHN ECHO SEQUENCE ---
+    # Instead of idling, we actively refocus the qubit.
+    if delay_us > 0:
+        half_delay = delay_us / 2
+        
+        # 1. Drift for t/2
+        qc.delay(half_delay, 2, unit='us')
+        
+        # 2. Refocusing Pulse (Bit Flip)
+        qc.x(2)
+        
+        # 3. Drift for t/2 (Unwinds the phase error)
+        qc.delay(half_delay, 2, unit='us')
+        
+        # 4. Restore Bit State (Flip back)
+        qc.x(2)
+    
+    # Critical PGE Reset (Happens in parallel on q0/q1)
+    qc.reset(0)
+    qc.reset(1)
+    qc.barrier()
+
+    # Hop 2: Inbound
+    qc.h(1)
+    qc.cx(1, 0)
+    qc.cx(2, 1)
+    qc.h(2)
+    qc.measure(2, cr_hop2[0])
+    qc.measure(1, cr_hop2[1])
+    with qc.if_test((cr_hop2[1], 1)):
+        qc.x(0)
+    with qc.if_test((cr_hop2[0], 1)):
+        qc.z(0)
+    qc.barrier()
+
+    # Verify
+    qc.h(0)
+    qc.x(0)
+    qc.measure(0, result)
+    return qc
+
+# 4. PREPARE BATCH
+# Testing the same durations to compare against the "Decayed" results
+delay_times = [0, 50, 100, 150] 
+circuits = []
+
+print(f"[Status] Building {len(delay_times)} Echo-Enabled circuits...")
+for t in delay_times:
+    qc = create_pge_echo_circuit(t)
+    circuits.append(qc)
+
+# 5. TRANSPILE
+print("[Status] Transpiling batch with optimization level 3...")
+pm = generate_preset_pass_manager(backend=backend, optimization_level=3)
+isa_circuits = pm.run(circuits)
+
+# 6. RUN BATCH JOB
+print(f"[Status] Submitting Job to {backend.name}...")
+sampler = Sampler(backend)
+job = sampler.run(isa_circuits)
+job_id = job.job_id()
+print(f"[Job ID] {job_id}")
+print("[Status] Waiting for results...")
+
+# 7. ANALYZE RESULTS
+result = job.result()
+
+print(f"\n--- PGE + HAHN ECHO RESULTS: {backend.name} ---")
+print(f"{'DELAY (us)':<15} | {'FIDELITY':<10} | {'IMPROVEMENT'}")
+print("-" * 55)
+
+for i, pub_result in enumerate(result):
+    counts = pub_result.data.verified.get_counts()
+    valid_count = counts.get('0', 0)
+    total = sum(counts.values())
+    fidelity = (valid_count / total) * 100
+    
+    delay_val = delay_times[i]
+    
+    # Contextual status
+    status = "BASELINE"
+    if delay_val > 0:
+        if fidelity > 60: status = "RECOVERED"
+        elif fidelity > 45: status = "PARTIAL"
+        else: status = "FAILED"
+        
+    print(f"{delay_val:<15} | {fidelity:.1f}%     | {status}")
+
+print("-" * 55)
